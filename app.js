@@ -13,11 +13,13 @@ const THUMB_EDGE = 360;
 const OUTSIDE_WAIT_MS = 1500;      // 离开超过 1.5 秒再回来才算"出去截图了"
 const PENDING_TTL_MS = 30 * 60 * 1000;
 
-const DEFAULT_APPS = [
-  { id: 'jd', name: '京东', url: 'https://m.jd.com' },
-  { id: 'taobao', name: '淘宝', url: 'https://m.taobao.com' },
-  { id: 'meituan', name: '美团', url: 'https://i.meituan.com' },
+// 内置常用比价应用：安卓用 intent 直接拉起已安装 App，没装自动落网页；iPhone 用通用链接。
+const BUILTIN_APPS = [
+  { key: 'jd', name: '京东', androidPackage: 'com.jingdong.app.mall', androidPath: 'm.jd.com', https: 'https://m.jd.com' },
+  { key: 'pupu', name: '朴朴超市', androidPackage: 'com.pupumall.customer', androidPath: 'www.pupumall.com', https: 'https://www.pupumall.com' },
+  { key: 'taobao', name: '淘宝', androidPackage: 'com.taobao.taobao', androidPath: 'm.taobao.com', https: 'https://m.taobao.com' },
 ];
+const LEGACY_SEED_IDS = ['jd', 'taobao', 'meituan', '1688', 'pinduoduo', 'app']; // 旧默认应用，迁移时清掉
 
 const state = {
   sheet: null,
@@ -25,6 +27,7 @@ const state = {
   photos: [],
   apps: [],
   pendingShot: null,
+  agent: { url: '', pin: '', keyword: '' },
   settings: { operator: '' },
   view: 'home',
   filter: '',
@@ -145,15 +148,166 @@ function normalizeUrl(raw) {
 
 async function loadApps() {
   let apps = await dbGet(STORE_KV, 'compare_apps');
-  if (!Array.isArray(apps) || !apps.length) {
-    apps = DEFAULT_APPS.map((a) => Object.assign({ createdAt: nowText() }, a));
-    await dbPut(STORE_KV, apps, 'compare_apps');
-  }
+  if (!Array.isArray(apps)) apps = [];
+  // 迁移：清掉旧版内置的默认应用（京东/淘宝/美团等），只保留用户自己加的
+  apps = apps.filter((a) => a && !LEGACY_SEED_IDS.includes(String(a.id || '')));
   state.apps = apps;
+  await dbPut(STORE_KV, state.apps, 'compare_apps');
 }
+
+function isAndroid() {
+  return /Android/i.test(navigator.userAgent || '');
+}
+function isIOS() {
+  return /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+}
+
+// 安卓优先 intent（可拉起已安装 App，未装自动回到网页）；iOS 用通用链接；其余用 https。
+function buildLaunchUrl(app) {
+  const https = app.url || app.https || '';
+  if (!https) return '';
+  if (isAndroid() && app.androidPackage) {
+    const scheme = /^https?:/i.test(https) ? 'https' : 'https';
+    const path = app.androidPath || https.replace(/^https?:\/\//i, '').split('?')[0];
+    return `intent://${path}#Intent;scheme=${scheme};package=${app.androidPackage};S.browser_fallback_url=${encodeURIComponent(https)};end`;
+  }
+  if (isIOS()) return app.iosUrl || https;
+  return https;
+}
+
+function recentApps() {
+  return state.apps
+    .slice()
+    .sort((a, b) => Number(b.lastUsedAt || 0) - Number(a.lastUsedAt || 0))
+    .filter((a) => a.lastUsedAt)
+    .slice(0, 3);
+}
+
+function builtinAdded(key) {
+  return state.apps.some((a) => a.builtinKey === key);
+}
+
+async function addBuiltinApp(key, seq) {
+  const lib = BUILTIN_APPS.find((b) => b.key === key);
+  if (!lib || builtinAdded(key)) return;
+  state.apps.push({
+    id: 'builtin:' + key,
+    builtinKey: key,
+    name: lib.name,
+    url: lib.https,
+    androidPackage: lib.androidPackage,
+    androidPath: lib.androidPath,
+    okCount: 0,
+    failCount: 0,
+    createdAt: nowText(),
+  });
+  await saveApps();
+  toast(`已添加「${lib.name}」`, 'ok');
+  openOnlineSheet(seq);
+}
+
+async function noteLaunchResult(appId, ok) {
+  const app = state.apps.find((a) => String(a.id) === String(appId));
+  if (!app) return;
+  if (ok) app.okCount = Number(app.okCount || 0) + 1;
+  else app.failCount = Number(app.failCount || 0) + 1;
+  await saveApps();
+}
+
 
 async function saveApps() {
   await dbPut(STORE_KV, state.apps, 'compare_apps');
+}
+
+/* ------------------------------ 电脑取图助手 ------------------------------ */
+async function loadAgent() {
+  const saved = await dbGet(STORE_KV, 'agent');
+  if (saved) state.agent = Object.assign(state.agent, saved);
+  if (!state.agent.url) {
+    const host = location.hostname;
+    if (host && host !== 'localhost' && !host.endsWith('github.io')) state.agent.url = location.origin;
+  }
+}
+
+async function saveAgent() {
+  await dbPut(STORE_KV, state.agent, 'agent');
+}
+
+function agentBase() {
+  const url = String(state.agent.url || '').trim().replace(/\/+$/, '');
+  return url;
+}
+
+async function agentFetch(path, opts = {}, timeoutMs = 9000) {
+  const base = agentBase();
+  if (!base) throw new Error('还没设置取图助手地址');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(base + path, Object.assign({ signal: ctrl.signal }, opts));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function captureFromAgent(seq) {
+  if (!agentBase()) { toast('先在上方填取图助手地址', 'error'); return; }
+  if (!state.agent.pin) { toast('先填配对码', 'error'); return; }
+  busy('正在让电脑截图…');
+  try {
+    const res = await agentFetch('/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: state.agent.pin, keyword: state.agent.keyword, delayMs: 2500 }),
+    }, 40000);
+    if (!res.ok) {
+      let msg = '';
+      try { msg = (await res.json()).error || ''; } catch (err) { msg = ''; }
+      throw new Error(msg || ('电脑返回 ' + res.status));
+    }
+    const blob = await res.blob();
+    if (!blob.size) throw new Error('电脑返回空图片');
+    const file = new File([blob], '电脑截图.png', { type: 'image/png' });
+    await addPhotos([file], { kind: 'online', seq, appName: '电脑截屏' });
+    toast('已从电脑取到截图', 'ok');
+  } catch (err) {
+    const msg = err && err.name === 'AbortError' ? '电脑没回应（检查助手是否在运行）' : (err.message || String(err));
+    toast('取图失败：' + msg, 'error');
+  } finally {
+    unbusy();
+  }
+}
+
+async function pickAgentWindow() {
+  try {
+    const res = await agentFetch('/windows');
+    const data = await res.json();
+    const list = (data.windows || []).filter((w) => (w.width || 0) > 120 && !w.minimized);
+    openModal(`
+      <div class="sheet-head"><h3>选择投屏窗口</h3><button class="icon-btn" data-close-x>×</button></div>
+      <p class="hint">在电脑上把手机投屏打开，然后选它。</p>
+      <div class="app-grid">
+        ${list.map((w) => `<button class="app-chip" data-win="${esc(w.title)}">${esc(w.title)}<span class="chip-tag">${w.width}×${w.height}</span></button>`).join('') || '<p class="muted">没有可选窗口</p>'}
+      </div>`);
+    $$('[data-win]').forEach((btn) => {
+      btn.onclick = async () => {
+        state.agent.keyword = btn.dataset.win;
+        await saveAgent();
+        try {
+          await agentFetch('/window', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ keyword: state.agent.keyword }),
+          });
+        } catch (err) { /* 本地已保存，下次截图会带上 */ }
+        closeModal();
+        render();
+        toast('投屏窗口已设为：' + state.agent.keyword, 'ok');
+      };
+    });
+  } catch (err) {
+    toast('连不上电脑：' + (err.message || err), 'error');
+  }
 }
 
 async function loadPendingShot() {
@@ -329,6 +483,19 @@ function decodeImage(blob) {
 }
 
 async function makeThumb(blob) {
+  // 能用 createImageBitmap 的浏览器直接在解码时降采样，比"整图解码+画布缩放"快很多
+  if (window.createImageBitmap) {
+    try {
+      const img = await createImageBitmap(blob, { resizeWidth: THUMB_EDGE, resizeQuality: 'medium' });
+      const scale = Math.min(1, THUMB_EDGE / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      if (img.close) img.close();
+      return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.8));
+    } catch (err) { /* 落到下面的通用路径 */ }
+  }
   const img = await decodeImage(blob);
   const w = img.width || img.naturalWidth;
   const h = img.height || img.naturalHeight;
@@ -341,6 +508,40 @@ async function makeThumb(blob) {
   return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.8));
 }
 
+// 一次解码同时产出「存储用大图」和「缩略图」，避免一张照片解码两遍（手机上这一步最费时间）
+async function prepareImage(file) {
+  let src = file;
+  if (window.createImageBitmap) {
+    try { src = await createImageBitmap(file); } catch (err) { src = await decodeImage(file); }
+  } else {
+    src = await decodeImage(file);
+  }
+  const w = src.width || src.naturalWidth;
+  const h = src.height || src.naturalHeight;
+  if (!w || !h) throw new Error('图片无法读取');
+  const longEdge = Math.max(w, h);
+  let blob = file;
+  let ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+  if (!/^(jpg|jpeg|png|webp)$/.test(ext)) ext = 'jpg';
+  if (longEdge > 2400 || file.size > 1.5 * 1024 * 1024) {
+    const scale = Math.min(1, 2400 / longEdge);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    canvas.getContext('2d').drawImage(src, 0, 0, canvas.width, canvas.height);
+    const out = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+    if (out && out.size < file.size) { blob = out; ext = 'jpg'; }
+  }
+  const thumbScale = Math.min(1, THUMB_EDGE / longEdge);
+  const thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = Math.max(1, Math.round(w * thumbScale));
+  thumbCanvas.height = Math.max(1, Math.round(h * thumbScale));
+  thumbCanvas.getContext('2d').drawImage(src, 0, 0, thumbCanvas.width, thumbCanvas.height);
+  if (src.close) src.close();
+  const thumb = await new Promise((resolve) => thumbCanvas.toBlob(resolve, 'image/jpeg', 0.8));
+  return { blob, thumb, ext: ext === 'jpeg' ? 'jpg' : ext };
+}
+
 async function addPhotos(files, target) {
   const list = Array.from(files || []);
   if (!list.length) return;
@@ -351,23 +552,21 @@ async function addPhotos(files, target) {
       const file = list[i];
       if (file.size > MAX_PHOTO_BYTES) { toast(`${file.name} 超过 12MB，已跳过`, 'error'); continue; }
       $('#busy-text').textContent = `正在保存照片 ${i + 1}/${list.length}…`;
-      let blob = file;
-      let ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
-      if (!/^(jpg|jpeg|png|webp)$/.test(ext)) ext = 'jpg';
-      const thumb = await makeThumb(blob);
+      const prepared = await prepareImage(file);
       const photo = {
         kind: target.kind,
         seq: target.seq || null,
         appName: target.appName || '',
-        blob,
-        thumb,
-        ext: ext === 'jpeg' ? 'jpg' : ext,
+        blob: prepared.blob,
+        thumb: prepared.thumb,
+        thumbUrl: URL.createObjectURL(prepared.thumb),
+        ext: prepared.ext,
         createdAt: nowText(),
       };
       await dbPut(STORE_PHOTOS, photo);
+      state.photos.push(photo);
       added += 1;
     }
-    state.photos = await dbAll(STORE_PHOTOS);
     render();
     toast(`已添加 ${added} 张照片`, 'ok');
   } catch (err) {
@@ -492,6 +691,18 @@ function homeView() {
       <label class="field"><span>验收人 / 操作员</span>
         <input class="input" id="operator" value="${esc(state.settings.operator)}" placeholder="例如 张三"></label>
       <p class="hint">回传包只写入「询价结果」，照片放在 照片/、补拍/、比价/ 三个文件夹。</p>
+    </section>
+    <section class="card">
+      <div class="sheet-head" style="padding:0 0 8px"><h3 style="margin:0">电脑取图（可选）</h3></div>
+      <label class="field"><span>取图助手地址</span>
+        <input class="input" id="agent-url" inputmode="url" value="${esc(state.agent.url)}" placeholder="http://192.168.1.10:8770"></label>
+      <label class="field"><span>配对码</span>
+        <input class="input" id="agent-pin" inputmode="numeric" value="${esc(state.agent.pin)}" placeholder="助手窗口里显示的 6 位数字"></label>
+      <p class="hint">投屏窗口：${state.agent.keyword ? esc(state.agent.keyword) : '未选择'}</p>
+      <div class="modal-actions">
+        <button class="btn small" data-action="agent-save">保存</button>
+        <button class="btn small" data-action="agent-window">选择投屏窗口</button>
+      </div>
     </section>`;
 }
 
@@ -504,6 +715,15 @@ function bindHome() {
     state.settings.operator = op.value.trim();
     await dbPut(STORE_KV, state.settings, 'settings');
   };
+  const saveBtn = $('[data-action="agent-save"]');
+  if (saveBtn) saveBtn.onclick = async () => {
+    state.agent.url = ($('#agent-url').value || '').trim();
+    state.agent.pin = ($('#agent-pin').value || '').trim();
+    await saveAgent();
+    toast('已保存', 'ok');
+  };
+  const winBtn = $('[data-action="agent-window"]');
+  if (winBtn) winBtn.onclick = pickAgentWindow;
 }
 
 function listView() {
@@ -531,7 +751,7 @@ function itemCard(item) {
       <div class="item-head">
         <span class="line-no">${item.seq}</span>
         <div class="item-title"><strong>${esc(item.name)}</strong>
-          <span class="muted">${esc(item.unit)} · 实送 ${fmtQty(item.qty)} · 报单价 ${money(item.basePrice)}</span></div>
+          <span class="muted">实送 ${fmtQty(item.qty)} ${esc(item.unit)} · 报单价 ${money(item.basePrice)}</span></div>
       </div>
       <div class="item-row">
         <label class="inquiry"><span>询价结果</span>
@@ -601,30 +821,51 @@ function openOnlineSheet(seq) {
   const item = state.items.find((i) => i.seq === seq);
   if (!item) return;
   const shots = onlinePhotos(seq);
+  const recent = recentApps();
+  const builtinCards = BUILTIN_APPS.map((b) => {
+    const added = builtinAdded(b.key);
+    return `<button class="app-chip ${added ? 'on' : ''}" ${added ? `data-app="builtin:${b.key}"` : `data-builtin="${b.key}"`}>
+      ${esc(b.name)}<span class="chip-tag">${added ? '✓' : '＋'}</span></button>`;
+  }).join('');
+  const myApps = state.apps.filter((a) => !a.builtinKey);
   openModal(`
     <div class="sheet-head"><h3>线上比价</h3><button class="icon-btn" data-close-x>×</button></div>
-    <p class="muted">第 ${item.seq} 项 · ${esc(item.name)}（${esc(item.unit)}）</p>
+    <p class="muted">第 ${item.seq} 项 · ${esc(item.name)}</p>
+    ${recent.length ? `<p class="sect-title">最近使用</p>
+    <div class="app-grid">${recent.map((a) => `<button class="app-chip" data-app="${esc(a.id)}">${esc(a.name)}</button>`).join('')}</div>` : ''}
+    <p class="sect-title">常用应用</p>
+    <div class="app-grid">${builtinCards}</div>
+    <p class="sect-title">我的应用</p>
     <div class="app-grid">
-      ${state.apps.map((a) => `<button class="app-chip" data-app="${esc(a.id)}">${esc(a.name)}<span class="chip-x" data-del-app="${esc(a.id)}" title="删除">×</span></button>`).join('')}
-      <button class="app-chip add" data-add-app>＋ 添加应用</button>
+      ${myApps.map((a) => `<button class="app-chip" data-app="${esc(a.id)}">${esc(a.name)}<span class="chip-x" data-del-app="${esc(a.id)}" title="删除">×</span></button>`).join('')}
+      <button class="app-chip add" data-add-app>＋ 自定义</button>
     </div>
-    <div class="modal-actions">
+    <div class="modal-actions" style="margin-top:14px">
       <button class="btn primary" data-upload-shot>上传截图${shots.length ? `（已加 ${shots.length} 张）` : ''}</button>
     </div>
+    ${agentBase() ? `<div class="modal-actions">
+      <button class="btn" data-agent-shot>电脑截投屏</button>
+    </div>` : ''}
     <div class="modal-actions">
       <button class="btn" data-camera-shot>拍照</button>
       <button class="btn" data-close-x>关闭</button>
     </div>
-    <p class="hint">打开应用截图后，切回本页会自动弹出「上传截图」。</p>`);
+    <p class="hint">点应用直接进 App（没装则打开网页）；截图后切回本页会自动弹出「上传截图」。</p>`);
 
   const shotInput = $('#file-online');
   const camInput = $('#file-online-cam');
+  const launch = (appId) => {
+    const app = state.apps.find((a) => String(a.id) === appId);
+    if (app) openCompareApp(app, seq);
+  };
   $$('[data-app]').forEach((btn) => {
     btn.onclick = (ev) => {
       if (ev.target.closest('[data-del-app]')) return;
-      const app = state.apps.find((a) => String(a.id) === btn.dataset.app);
-      if (app) openCompareApp(app, seq);
+      launch(btn.dataset.app);
     };
+  });
+  $$('[data-builtin]').forEach((btn) => {
+    btn.onclick = () => addBuiltinApp(btn.dataset.builtin, seq);
   });
   $$('[data-del-app]').forEach((el) => {
     el.onclick = async (ev) => {
@@ -640,6 +881,8 @@ function openOnlineSheet(seq) {
   $('[data-add-app]').onclick = () => openAddApp(seq);
   $('[data-upload-shot]').onclick = () => { shotInput.dataset.seq = String(seq); shotInput.click(); };
   $('[data-camera-shot]').onclick = () => { camInput.dataset.seq = String(seq); camInput.click(); };
+  const agentBtn = $('[data-agent-shot]');
+  if (agentBtn) agentBtn.onclick = () => { closeModal(); captureFromAgent(seq); };
 }
 
 function openAddApp(seq) {
@@ -647,11 +890,24 @@ function openAddApp(seq) {
     <div class="sheet-head"><h3>添加比价应用</h3><button class="icon-btn" data-close-x>×</button></div>
     <label class="field"><span>应用名称</span><input class="input" id="app-name" placeholder="例如 拼多多"></label>
     <label class="field"><span>链接</span><input class="input" id="app-url" inputmode="url" placeholder="https://m.pinduoduo.com"></label>
+    <button class="btn small ghost" id="app-paste">从剪贴板粘贴链接</button>
     <p class="hint">填 https:// 开头的网址最稳；App 专用链接（如 taobao://）部分手机会被浏览器拦截。</p>
     <div class="modal-actions">
       <button class="btn" data-close-x>取消</button>
       <button class="btn primary" id="app-save">保存</button>
     </div>`);
+  $('#app-paste').onclick = async () => {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (!text) { toast('剪贴板是空的', 'error'); return; }
+      $('#app-url').value = text;
+      if (!$('#app-name').value.trim()) {
+        try { $('#app-name').value = new URL(normalizeUrl(text)).hostname.replace(/^www\./, ''); } catch (err) { /* ignore */ }
+      }
+    } catch (err) {
+      toast('读不到剪贴板，请手动粘贴', 'error');
+    }
+  };
   $('#app-save').onclick = async () => {
     const name = $('#app-name').value.trim();
     const url = normalizeUrl($('#app-url').value);
@@ -666,16 +922,20 @@ function openAddApp(seq) {
 }
 
 async function openCompareApp(app, seq) {
-  await setPendingShot({ seq, appName: app.name, at: Date.now(), prompted: false });
+  await setPendingShot({ seq, appName: app.name, appId: app.id, at: Date.now(), prompted: false });
   closeModal();
+  app.lastUsedAt = Date.now();
+  app.lastMode = isAndroid() && app.androidPackage ? 'intent' : (isIOS() ? 'ios' : 'https');
+  await saveApps();
+  const target = buildLaunchUrl(app);
   let opened = null;
   try {
-    opened = window.open(app.url, '_blank');
+    opened = window.open(target, '_blank');
   } catch (err) {
     opened = null;
   }
   if (!opened) {
-    location.href = app.url;
+    location.href = target;
     return;
   }
   toast(`正在打开「${app.name}」，截图后切回来`, 'ok');
@@ -699,8 +959,16 @@ async function maybePromptReturn() {
       <button class="btn primary block" id="return-upload">上传截图${shots.length ? `（已加 ${shots.length} 张）` : ''}</button>
     </div>
     <div class="modal-actions">
+      <button class="btn small" id="return-ok">进去了 ✓</button>
+      <button class="btn small" id="return-fail">没打开 ✗</button>
       <button class="btn" id="return-close">先不传</button>
     </div>`);
+  const markLaunch = async (ok) => {
+    if (pending.appId) await noteLaunchResult(pending.appId, ok);
+    toast(ok ? '已记住这个应用可以直接打开' : '已记住，下次改用网页打开', 'ok');
+  };
+  $('#return-ok').onclick = () => markLaunch(true);
+  $('#return-fail').onclick = () => markLaunch(false);
   $('#return-upload').onclick = () => {
     const shotInput = $('#file-online');
     shotInput.dataset.seq = String(item.seq);
@@ -768,7 +1036,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261121120608-cdab7c6e';
+  if (version) version.content = '20261121163152-7cc5ff45';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
@@ -784,6 +1052,7 @@ async function init() {
     const settings = await dbGet(STORE_KV, 'settings');
     if (settings) state.settings = Object.assign(state.settings, settings);
     await loadApps();
+    await loadAgent();
     await loadPendingShot();
     const sheet = await dbGet(STORE_KV, 'sheet');
     if (sheet) {
