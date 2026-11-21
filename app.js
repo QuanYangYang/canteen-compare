@@ -566,7 +566,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261121032044-d72fd133';
+  if (version) version.content = '20261121033941-d72fd133';
 }
 
 async function init() {
