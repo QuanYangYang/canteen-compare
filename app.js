@@ -491,7 +491,7 @@ function homeView() {
     <section class="card">
       <label class="field"><span>验收人 / 操作员</span>
         <input class="input" id="operator" value="${esc(state.settings.operator)}" placeholder="例如 张三"></label>
-      <p class="hint">回传包只写入「询价结果」，照片放在 照片/ 与 补拍/ 两个文件夹。</p>
+      <p class="hint">回传包只写入「询价结果」，照片放在 照片/、补拍/、比价/ 三个文件夹。</p>
     </section>`;
 }
 
@@ -768,7 +768,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261121113925-3990f881';
+  if (version) version.content = '20261121120608-cdab7c6e';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
