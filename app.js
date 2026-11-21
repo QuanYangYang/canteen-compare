@@ -10,11 +10,21 @@ const STORE_ITEMS = 'items';
 const STORE_PHOTOS = 'photos';
 const MAX_PHOTO_BYTES = 12 * 1024 * 1024;
 const THUMB_EDGE = 360;
+const OUTSIDE_WAIT_MS = 1500;      // 离开超过 1.5 秒再回来才算"出去截图了"
+const PENDING_TTL_MS = 30 * 60 * 1000;
+
+const DEFAULT_APPS = [
+  { id: 'jd', name: '京东', url: 'https://m.jd.com' },
+  { id: 'taobao', name: '淘宝', url: 'https://m.taobao.com' },
+  { id: 'meituan', name: '美团', url: 'https://i.meituan.com' },
+];
 
 const state = {
   sheet: null,
   items: [],
   photos: [],
+  apps: [],
+  pendingShot: null,
   settings: { operator: '' },
   view: 'home',
   filter: '',
@@ -124,6 +134,44 @@ async function persistItem(item) {
   await dbPut(STORE_ITEMS, item);
 }
 
+/* ------------------------------ 线上比价应用 ------------------------------ */
+function normalizeUrl(raw) {
+  let text = String(raw || '').trim();
+  if (!text) return '';
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return text;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(text)) return text; // taobao:// 这类
+  return 'https://' + text.replace(/^\/+/, '');
+}
+
+async function loadApps() {
+  let apps = await dbGet(STORE_KV, 'compare_apps');
+  if (!Array.isArray(apps) || !apps.length) {
+    apps = DEFAULT_APPS.map((a) => Object.assign({ createdAt: nowText() }, a));
+    await dbPut(STORE_KV, apps, 'compare_apps');
+  }
+  state.apps = apps;
+}
+
+async function saveApps() {
+  await dbPut(STORE_KV, state.apps, 'compare_apps');
+}
+
+async function loadPendingShot() {
+  const saved = await dbGet(STORE_KV, 'pending_shot');
+  if (!saved) return;
+  if (Date.now() - Number(saved.at || 0) > PENDING_TTL_MS) {
+    await dbDel(STORE_KV, 'pending_shot');
+    return;
+  }
+  state.pendingShot = saved;
+}
+
+async function setPendingShot(pending) {
+  state.pendingShot = pending;
+  if (pending) await dbPut(STORE_KV, pending, 'pending_shot');
+  else await dbDel(STORE_KV, 'pending_shot');
+}
+
 /* ------------------------------ UI 基础 ------------------------------ */
 function toast(message, kind = '') {
   const root = $('#toast');
@@ -199,6 +247,7 @@ async function exportPackage() {
     };
     addEntry(`比价信息表_${state.sheet.sheetNo}.xlsx`, new Uint8Array(xlsx));
     const perLine = {};
+    const perLineOnline = {};
     let extraCount = 0;
     const photos = state.photos.slice();
     for (let i = 0; i < photos.length; i++) {
@@ -212,6 +261,11 @@ async function exportPackage() {
       if (photo.kind === 'extra') {
         extraCount += 1;
         addEntry(`补拍/${base}-补-${extraCount}.${ext}`, bytes);
+      } else if (photo.kind === 'online') {
+        const lineSeq = Number(photo.seq) || 0;
+        perLineOnline[lineSeq] = (perLineOnline[lineSeq] || 0) + 1;
+        const line = String(lineSeq).padStart(2, '0');
+        addEntry(`比价/${base}-${line}-${perLineOnline[lineSeq]}.${ext}`, bytes);
       } else {
         perLine[photo.seq] = (perLine[photo.seq] || 0) + 1;
         const line = String(photo.seq).padStart(2, '0');
@@ -304,6 +358,7 @@ async function addPhotos(files, target) {
       const photo = {
         kind: target.kind,
         seq: target.seq || null,
+        appName: target.appName || '',
         blob,
         thumb,
         ext: ext === 'jpeg' ? 'jpg' : ext,
@@ -324,6 +379,9 @@ async function addPhotos(files, target) {
 
 function photosFor(seq) {
   return state.photos.filter((p) => p.kind === 'item' && p.seq === seq);
+}
+function onlinePhotos(seq) {
+  return state.photos.filter((p) => p.kind === 'online' && p.seq === seq);
 }
 function extraPhotos() {
   return state.photos.filter((p) => p.kind === 'extra');
@@ -466,6 +524,7 @@ function listView() {
 
 function itemCard(item) {
   const photos = photosFor(item.seq);
+  const shots = onlinePhotos(item.seq);
   const filled = item.inquiry !== null && item.inquiry !== '';
   return `
     <article class="item ${filled ? 'done' : ''}" data-seq="${item.seq}">
@@ -480,6 +539,10 @@ function itemCard(item) {
             value="${filled ? item.inquiry : ''}" placeholder="填单价"></label>
         <button class="btn small" data-convert="${item.seq}">换算</button>
         <button class="btn small icon" data-photo="${item.seq}">拍照${photos.length ? ' ' + photos.length : ''}</button>
+      </div>
+      <div class="online-row">
+        <button class="btn small online-btn" data-online="${item.seq}">线上比价${shots.length ? ' ' + shots.length : ''}</button>
+        ${shots.length ? `<div class="thumb-row online-thumbs">${shots.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
       </div>
       ${photos.length ? `<div class="thumb-row">${photos.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
     </article>`;
@@ -514,6 +577,9 @@ function bindList() {
   $$('[data-photo]').forEach((btn) => {
     btn.onclick = () => { $('#file-photo').dataset.seq = btn.dataset.photo; $('#file-photo').click(); };
   });
+  $$('[data-online]').forEach((btn) => {
+    btn.onclick = () => openOnlineSheet(Number(btn.dataset.online));
+  });
   const extra = $('[data-action="extra-photo"]');
   if (extra) extra.onclick = () => { $('#file-photo').dataset.seq = ''; $('#file-photo').click(); };
   const home = $('[data-action="home"]');
@@ -530,6 +596,130 @@ function paintThumbs() {
   }
 }
 
+/* ------------------------------ 线上比价 ------------------------------ */
+function openOnlineSheet(seq) {
+  const item = state.items.find((i) => i.seq === seq);
+  if (!item) return;
+  const shots = onlinePhotos(seq);
+  openModal(`
+    <div class="sheet-head"><h3>线上比价</h3><button class="icon-btn" data-close-x>×</button></div>
+    <p class="muted">第 ${item.seq} 项 · ${esc(item.name)}（${esc(item.unit)}）</p>
+    <div class="app-grid">
+      ${state.apps.map((a) => `<button class="app-chip" data-app="${esc(a.id)}">${esc(a.name)}<span class="chip-x" data-del-app="${esc(a.id)}" title="删除">×</span></button>`).join('')}
+      <button class="app-chip add" data-add-app>＋ 添加应用</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" data-upload-shot>上传截图${shots.length ? `（已加 ${shots.length} 张）` : ''}</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" data-camera-shot>拍照</button>
+      <button class="btn" data-close-x>关闭</button>
+    </div>
+    <p class="hint">打开应用截图后，切回本页会自动弹出「上传截图」。</p>`);
+
+  const shotInput = $('#file-online');
+  const camInput = $('#file-online-cam');
+  $$('[data-app]').forEach((btn) => {
+    btn.onclick = (ev) => {
+      if (ev.target.closest('[data-del-app]')) return;
+      const app = state.apps.find((a) => String(a.id) === btn.dataset.app);
+      if (app) openCompareApp(app, seq);
+    };
+  });
+  $$('[data-del-app]').forEach((el) => {
+    el.onclick = async (ev) => {
+      ev.stopPropagation();
+      const app = state.apps.find((a) => String(a.id) === el.dataset.delApp);
+      if (!app) return;
+      if (!window.confirm(`删除「${app.name}」？`)) return;
+      state.apps = state.apps.filter((a) => a.id !== app.id);
+      await saveApps();
+      openOnlineSheet(seq);
+    };
+  });
+  $('[data-add-app]').onclick = () => openAddApp(seq);
+  $('[data-upload-shot]').onclick = () => { shotInput.dataset.seq = String(seq); shotInput.click(); };
+  $('[data-camera-shot]').onclick = () => { camInput.dataset.seq = String(seq); camInput.click(); };
+}
+
+function openAddApp(seq) {
+  openModal(`
+    <div class="sheet-head"><h3>添加比价应用</h3><button class="icon-btn" data-close-x>×</button></div>
+    <label class="field"><span>应用名称</span><input class="input" id="app-name" placeholder="例如 拼多多"></label>
+    <label class="field"><span>链接</span><input class="input" id="app-url" inputmode="url" placeholder="https://m.pinduoduo.com"></label>
+    <p class="hint">填 https:// 开头的网址最稳；App 专用链接（如 taobao://）部分手机会被浏览器拦截。</p>
+    <div class="modal-actions">
+      <button class="btn" data-close-x>取消</button>
+      <button class="btn primary" id="app-save">保存</button>
+    </div>`);
+  $('#app-save').onclick = async () => {
+    const name = $('#app-name').value.trim();
+    const url = normalizeUrl($('#app-url').value);
+    if (!name) { toast('请填应用名称', 'error'); return; }
+    if (!url) { toast('请填链接', 'error'); return; }
+    state.apps.push({ id: 'app' + Date.now(), name, url, createdAt: nowText() });
+    await saveApps();
+    closeModal();
+    openOnlineSheet(seq);
+    toast(`已添加「${name}」`, 'ok');
+  };
+}
+
+async function openCompareApp(app, seq) {
+  await setPendingShot({ seq, appName: app.name, at: Date.now(), prompted: false });
+  closeModal();
+  let opened = null;
+  try {
+    opened = window.open(app.url, '_blank');
+  } catch (err) {
+    opened = null;
+  }
+  if (!opened) {
+    location.href = app.url;
+    return;
+  }
+  toast(`正在打开「${app.name}」，截图后切回来`, 'ok');
+}
+
+async function maybePromptReturn() {
+  const pending = state.pendingShot;
+  if (!pending || pending.prompted) return;
+  if (state.view !== 'list' || !state.sheet) return;
+  const item = state.items.find((i) => i.seq === pending.seq);
+  if (!item) return;
+  state.pendingShot = Object.assign({}, pending, { prompted: true });
+  await dbPut(STORE_KV, state.pendingShot, 'pending_shot');
+  flashItem(pending.seq);
+  const shots = onlinePhotos(pending.seq);
+  openModal(`
+    <div class="sheet-head"><h3>已回到比价单</h3><button class="icon-btn" data-close-x>×</button></div>
+    <p><strong>第 ${item.seq} 项 · ${esc(item.name)}</strong></p>
+    <p class="muted">刚从「${esc(pending.appName || '比价应用')}」回来，截好图了吗？</p>
+    <div class="modal-actions">
+      <button class="btn primary block" id="return-upload">上传截图${shots.length ? `（已加 ${shots.length} 张）` : ''}</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="return-close">先不传</button>
+    </div>`);
+  $('#return-upload').onclick = () => {
+    const shotInput = $('#file-online');
+    shotInput.dataset.seq = String(item.seq);
+    shotInput.click();
+  };
+  $('#return-close').onclick = async () => {
+    closeModal();
+    await setPendingShot(null);
+  };
+}
+
+function flashItem(seq) {
+  const card = $(`.item[data-seq="${seq}"]`);
+  if (!card) return;
+  card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  card.classList.add('flash');
+  setTimeout(() => card.classList.remove('flash'), 2000);
+}
+
 /* ------------------------------ 事件绑定 ------------------------------ */
 function bindGlobal() {
   $('#file-note').onchange = (ev) => {
@@ -544,6 +734,18 @@ function bindGlobal() {
     const target = seq ? { kind: 'item', seq: Number(seq) } : { kind: 'extra', seq: null };
     if (files.length) addPhotos(files, target);
   };
+  const handleShot = async (ev) => {
+    const files = Array.from(ev.target.files || []);
+    const seq = Number(ev.target.dataset.seq || 0);
+    ev.target.value = '';
+    if (!files.length || !seq) return;
+    const appName = (state.pendingShot && state.pendingShot.appName) || '';
+    await addPhotos(files, { kind: 'online', seq, appName });
+    await setPendingShot(null);
+    openOnlineSheet(seq);
+  };
+  $('#file-online').onchange = handleShot;
+  $('#file-online-cam').onchange = handleShot;
   document.addEventListener('click', (ev) => {
     if (ev.target.closest('[data-close-modal]') || ev.target.closest('[data-close-x]')) { closeModal(); return; }
     const back = ev.target.closest('#back-btn');
@@ -566,13 +768,23 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261121033941-d72fd133';
+  if (version) version.content = '20261121113925-3990f881';
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
+    const away = state.awayAt ? Date.now() - state.awayAt : 0;
+    state.awayAt = 0;
+    if (away >= OUTSIDE_WAIT_MS) maybePromptReturn();
+  });
+  window.addEventListener('pageshow', () => { maybePromptReturn(); });
 }
 
 async function init() {
   try {
     const settings = await dbGet(STORE_KV, 'settings');
     if (settings) state.settings = Object.assign(state.settings, settings);
+    await loadApps();
+    await loadPendingShot();
     const sheet = await dbGet(STORE_KV, 'sheet');
     if (sheet) {
       state.sheet = sheet;
