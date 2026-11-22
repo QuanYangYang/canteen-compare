@@ -1,4 +1,4 @@
-/* 武汉大功率机车检修段 · 询价比价系统手机端B1
+﻿/* 武汉大功率机车检修段 · 询价比价系统手机端B1
    导入电脑端「比价信息表」→ 逐项填询价结果（可拍照/换算）→ 导出回传包。 */
 'use strict';
 
@@ -250,9 +250,48 @@ async function agentFetch(path, opts = {}, timeoutMs = 9000) {
   }
 }
 
+async function ensureAgentPin() {
+  if (state.agent.pin) return true;
+  try {
+    const res = await agentFetch('/ping', {}, 4000);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.pin) {
+        state.agent.pin = String(data.pin);
+        await saveAgent();
+        return true;
+      }
+    }
+  } catch (err) { /* 连不上就让用户手填 */ }
+  return false;
+}
+
+function openAgentConfig(seq, message) {
+  openModal(`
+    <div class="sheet-head"><h3>连接电脑取图</h3><button class="icon-btn" data-close-x>×</button></div>
+    ${message ? `<p class="notice red">${esc(message)}</p>` : ''}
+    <label class="field"><span>取图助手地址</span>
+      <input class="input" id="cfg-url" inputmode="url" value="${esc(agentBase() || state.agent.url)}" placeholder="http://192.168.1.10:8770"></label>
+    <label class="field"><span>配对码</span>
+      <input class="input" id="cfg-pin" inputmode="numeric" value="${esc(state.agent.pin)}" placeholder="电脑助手窗口里显示的 6 位数字"></label>
+    <p class="hint">电脑上双击“取图助手.cmd”，窗口第一行会显示端口、配对码和手机访问地址。</p>
+    <div class="modal-actions">
+      <button class="btn" data-close-x>取消</button>
+      <button class="btn primary" id="cfg-save">保存并截图</button>
+    </div>`);
+  $('#cfg-save').onclick = async () => {
+    state.agent.url = ($('#cfg-url').value || '').trim();
+    state.agent.pin = ($('#cfg-pin').value || '').trim();
+    await saveAgent();
+    closeModal();
+    if (state.agent.pin) captureFromAgent(seq);
+    else toast('配对码没填，还是没法截图', 'error');
+  };
+}
+
 async function captureFromAgent(seq) {
-  if (!agentBase()) { toast('先在上方填取图助手地址', 'error'); return; }
-  if (!state.agent.pin) { toast('先填配对码', 'error'); return; }
+  if (!agentBase()) { openAgentConfig(seq, '还没有填取图助手地址'); return; }
+  if (!(await ensureAgentPin())) { openAgentConfig(seq, '需要配对码：电脑助手窗口里显示的 6 位数字'); return; }
   busy('正在让电脑截图…');
   try {
     const res = await agentFetch('/capture', {
@@ -272,6 +311,7 @@ async function captureFromAgent(seq) {
     toast('已从电脑取到截图', 'ok');
   } catch (err) {
     const msg = err && err.name === 'AbortError' ? '电脑没回应（检查助手是否在运行）' : (err.message || String(err));
+    if (/pair code|403|配对码/i.test(msg)) { openAgentConfig(seq, '配对码不对，请照着电脑窗口重新填'); return; }
     toast('取图失败：' + msg, 'error');
   } finally {
     unbusy();
@@ -1036,7 +1076,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261121163152-7cc5ff45';
+  if (version) version.content = '20261122072830-0079c328';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
