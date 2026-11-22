@@ -137,6 +137,7 @@ async function persistSheet() {
 }
 async function persistItem(item) {
   await dbPut(STORE_ITEMS, item);
+  syncSoon();
 }
 
 /* ------------------------------ 线上比价应用 ------------------------------ */
@@ -297,21 +298,61 @@ function openAgentConfig(seq, message) {
 }
 
 
+function agentSnapshot() {
+  const shots = (state.photos || []).filter((p) => p.kind === 'online');
+  const photos = (state.photos || []).filter((p) => p.kind !== 'online');
+  return {
+    sheet_no: state.sheet ? state.sheet.sheetNo : '',
+    waitSeq: state.waitTask ? state.waitTask.seq : null,
+    items: state.items.map((i) => ({
+      seq: i.seq,
+      name: i.name,
+      unit: i.unit,
+      qty: i.qty,
+      basePrice: i.basePrice,
+      inquiry: i.inquiry,
+      photos: photos.filter((p) => Number(p.seq) === Number(i.seq)).length,
+      shots: shots.filter((p) => Number(p.seq) === Number(i.seq)).length,
+    })),
+  };
+}
+
 async function syncSheetToAgent() {
   if (!agentBase() || !state.sheet) return;
   if (!(await ensureAgentPin())) return;
   try {
+    const snap = agentSnapshot();
+    snap.pin = state.agent.pin;
     await agentFetch('/sheet', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        pin: state.agent.pin,
-        sheet_no: state.sheet.sheetNo || '',
-        items: state.items.map((i) => ({ seq: i.seq, name: i.name, unit: i.unit, qty: i.qty })),
-      }),
+      body: JSON.stringify(snap),
     }, 8000);
+    state.lastSync = new Date();
+    try { const p = await agentFetch('/ping', {}, 4000); const d = await p.json(); state.agentVersion = d.version || ''; } catch (e) {}
     startAgentPoll();
-  } catch (err) { /* 电脑没开就忽略 */ }
+    updateAgentStatus();
+  } catch (err) {
+    state.lastSyncError = String((err && err.message) || err);
+    updateAgentStatus();
+  }
+}
+
+function syncSoon() {
+  if (state.syncTimer) clearTimeout(state.syncTimer);
+  state.syncTimer = setTimeout(() => { state.syncTimer = null; syncSheetToAgent(); }, 600);
+}
+
+function updateAgentStatus() {
+  const el = document.querySelector('#agent-status');
+  if (!el) return;
+  if (!agentBase()) { el.textContent = '电脑取图：未配置'; return; }
+  const bits = [];
+  bits.push(state.lastSync ? '已同步 ' + state.lastSync.toTimeString().slice(0, 8) : '还没同步');
+  if (state.waitTask) bits.push('等第 ' + state.waitTask.seq + ' 项截图');
+  if (state.agentVersion) bits.push('电脑 ' + state.agentVersion);
+  if (state.lastSyncError) bits.push('错误：' + state.lastSyncError);
+  el.textContent = '电脑取图：' + bits.join(' · ');
 }
 
 async function saveWaitTask(task) {
@@ -706,6 +747,7 @@ async function addPhotos(files, target) {
   } finally {
     unbusy();
   }
+  syncSoon();
 }
 
 function photosFor(seq) {
@@ -778,6 +820,7 @@ function topbar() {
 }
 
 function render() {
+  setTimeout(updateAgentStatus, 0);
   topbar();
   const view = $('#view');
   if (!state.sheet) { view.innerHTML = homeEmpty(); bindHomeEmpty(); return; }
@@ -855,6 +898,13 @@ function bindHome() {
     await saveAgent();
     toast('已保存', 'ok');
   };
+  const checkBtn = $('[data-action="agent-check"]');
+  if (checkBtn) checkBtn.onclick = async () => {
+    if (!agentBase()) { openAgentConfig(0, '先填取图助手地址'); return; }
+    await pollAgentShot();
+    updateAgentStatus();
+    toast('已检查一次', 'ok');
+  };
   const winBtn = $('[data-action="agent-window"]');
   if (winBtn) winBtn.onclick = pickAgentWindow;
 }
@@ -871,6 +921,8 @@ function listView() {
       <button class="btn small" data-action="extra-photo">补拍</button>
     </div>
     <p class="list-meter">已填 ${filled}/${state.items.length}${q ? ` · 命中 ${items.length}` : ''}</p>
+    <p class="agent-status-line"><span id="agent-status">电脑取图：未配置</span>
+      <button class="btn tiny" data-action="agent-check">检查电脑</button></p>
     <div class="item-list">${items.map(itemCard).join('') || '<div class="empty">没有匹配的商品</div>'}</div>
     <div class="bottom-bar"><button class="btn primary block" data-action="home">完成，去导出</button></div>`;
 }
@@ -1170,7 +1222,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261122083833-f2de5406';
+  if (version) version.content = '20261122085336-e6d55658';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
@@ -1189,7 +1241,10 @@ async function init() {
     await loadApps();
     await loadAgent();
     await restoreWaitTask();
-  if (agentBase()) startAgentPoll();
+  if (agentBase()) {
+    startAgentPoll();
+    setInterval(() => { if (document.visibilityState === 'visible') syncSheetToAgent(); }, 10000);
+  }
     await loadPendingShot();
     const sheet = await dbGet(STORE_KV, 'sheet');
     if (sheet) {

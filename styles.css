@@ -370,3 +370,6 @@ button { cursor: pointer; }
 .app-chip.on { border-color: rgba(31,92,69,.35); background: rgba(31,92,69,.06); }
 .chip-tag { margin-left: 6px; font-size: 12px; color: #1f5c45; font-weight: 700; }
 .app-grid .app-chip { position: relative; }
+
+.agent-status-line { display:flex; gap:8px; align-items:center; justify-content:space-between; margin:-4px 0 8px; font-size:12px; color:#6b726d; }
+.btn.tiny { padding:4px 10px; font-size:12px; border-radius:7px; }
