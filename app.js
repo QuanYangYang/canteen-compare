@@ -1,8 +1,8 @@
-﻿/* 武汉大功率机车检修段 · 询价比价系统手机端B1
+﻿/* 武汉大功率机车检修段 · 线下比价系统A1
    导入电脑端「比价信息表」→ 逐项填询价结果（可拍照/换算）→ 导出回传包。 */
 'use strict';
 
-const APP_TITLE = '询价比价系统手机端B1';
+const APP_TITLE = '线下比价系统A1';
 const DB_NAME = 'canteen-compare-b1';
 const DB_VERSION = 1;
 const STORE_KV = 'kv';
@@ -507,9 +507,20 @@ function openModal(html) {
 function closeModal() { $('#modal-root').innerHTML = ''; }
 
 /* ------------------------------ 导入 / 导出 ------------------------------ */
+async function importFromZip(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const entries = fflate.unzipSync(buf);
+  const names = Object.keys(entries).filter((n) => /\.xlsx$/i.test(n) && !n.split('/').pop().startsWith('~$'));
+  if (!names.length) throw new Error('压缩包里没有 xlsx');
+  const pick = names.find((n) => /比价信息表/.test(n)) || names[0];
+  const blob = new Blob([entries[pick]], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  return new File([blob], pick.split('/').pop(), { type: blob.type });
+}
+
 async function importWorkbook(file) {
   busy('正在解析比价信息表…');
   try {
+    if (/\.zip$/i.test(file.name || '')) file = await importFromZip(file);
     const buffer = await file.arrayBuffer();
     const parsed = CanteenCompareWorkbook.parseCompareWorkbook(new Uint8Array(buffer));
     const existing = state.sheet;
@@ -558,20 +569,25 @@ async function exportPackage() {
       entry.push(bytes, true);
     };
     addEntry(`比价信息表_${state.sheet.sheetNo}.xlsx`, new Uint8Array(xlsx));
-    const perLineOnline = {};
-    const photos = state.photos.filter((p) => p.kind === 'online');
+    const perLine = {};
+    let extraCount = 0;
+    const photos = state.photos.filter((p) => p.kind !== 'online');
     for (let i = 0; i < photos.length; i++) {
       const photo = photos[i];
-      $('#busy-text').textContent = `正在打包截图 ${i + 1}/${photos.length}…`;
+      $('#busy-text').textContent = `正在打包照片 ${i + 1}/${photos.length}…`;
       let blob = photo.blob;
       if (!blob) continue;
       if (blob.size > MAX_PHOTO_BYTES) blob = await compressPhoto(blob);
       const bytes = new Uint8Array(await blob.arrayBuffer());
       const ext = photo.ext || 'jpg';
-      const lineSeq = Number(photo.seq) || 0;
-      perLineOnline[lineSeq] = (perLineOnline[lineSeq] || 0) + 1;
-      const line = String(lineSeq).padStart(2, '0');
-      addEntry(`比价/${base}-${line}-${perLineOnline[lineSeq]}.${ext}`, bytes);
+      if (photo.kind === 'extra') {
+        extraCount += 1;
+        addEntry(`补拍/${base}-补-${extraCount}.${ext}`, bytes);
+      } else {
+        perLine[photo.seq] = (perLine[photo.seq] || 0) + 1;
+        const line = String(photo.seq).padStart(2, '0');
+        addEntry(`照片/${base}-${line}-${perLine[photo.seq]}.${ext}`, bytes);
+      }
     }
     zip.end();
     const blob = await done;
@@ -839,20 +855,9 @@ function homeView() {
     <section class="card">
       <label class="field"><span>验收人 / 操作员</span>
         <input class="input" id="operator" value="${esc(state.settings.operator)}" placeholder="例如 张三"></label>
-      <p class="hint">回传包只写入「询价结果」，截图放在 比价/ 文件夹。</p>
+      <p class="hint">回传包写入「询价结果」，照片放在 照片/、补拍/ 两个文件夹。</p>
     </section>
-    <section class="card">
-      <div class="sheet-head" style="padding:0 0 8px"><h3 style="margin:0">电脑同步（可选）</h3></div>
-      <label class="field"><span>取图助手地址</span>
-        <input class="input" id="agent-url" inputmode="url" value="${esc(state.agent.url)}" placeholder="http://192.168.1.10:8770"></label>
-      <label class="field"><span>配对码</span>
-        <input class="input" id="agent-pin" inputmode="numeric" value="${esc(state.agent.pin)}" placeholder="助手窗口里显示的 6 位数字"></label>
-      <p class="hint">电脑端在 http://电脑IP:8770/control 里选投屏窗口、截图；截图会自动回到对应货品。</p>
-      ${agentPageOrigin() ? '' : '<p class="notice red">当前是 https 页面，浏览器不允许连电脑。请改用 http://电脑IP:8770/ 打开本页。</p>'}
-      <div class="modal-actions">
-        <button class="btn small" data-action="agent-save">保存</button>
-      </div>
-    </section>`;
+    `;
 }
 
 function bindHome() {
@@ -891,10 +896,9 @@ function listView() {
   return `
     <div class="freeze-bar">
       <div class="search-box"><input id="q" type="search" placeholder="搜索品名 / 序号" value="${esc(state.filter)}"></div>
+      <button class="btn small" data-action="extra-photo">补拍</button>
     </div>
     <p class="list-meter">已填 ${filled}/${state.items.length}${q ? ` · 命中 ${items.length}` : ''}</p>
-    <p class="agent-status-line"><span id="agent-status">电脑取图：未配置</span>
-      <button class="btn tiny" data-action="agent-check">检查电脑</button></p>
     <div class="item-list">${items.map(itemCard).join('') || '<div class="empty">没有匹配的商品</div>'}</div>
     <div class="bottom-bar"><button class="btn primary block" data-action="home">完成，去导出</button></div>`;
 }
@@ -916,11 +920,9 @@ function itemCard(item) {
           <input class="input" type="number" inputmode="decimal" step="0.01" min="0" data-inquiry="${item.seq}"
             value="${filled ? item.inquiry : ''}" placeholder="填单价"></label>
         <button class="btn small" data-convert="${item.seq}">换算</button>
+        <button class="btn small icon" data-photo="${item.seq}">拍照${photos.length ? ' ' + photos.length : ''}</button>
       </div>
-      <div class="online-row">
-        <button class="btn small online-btn" data-shots="${item.seq}">上传截图${shots.length ? ' ' + shots.length : ''}</button>
-        ${shots.length ? `<div class="thumb-row online-thumbs">${shots.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
-      </div>
+      ${photos.length ? `<div class="thumb-row">${photos.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
     </article>`;
 }
 
@@ -950,12 +952,11 @@ function bindList() {
     };
   });
   $$('[data-convert]').forEach((btn) => { btn.onclick = () => openConvert(Number(btn.dataset.convert)); });
-  $$('[data-shots]').forEach((btn) => {
-    btn.onclick = () => {
-      state.shotSeq = Number(btn.dataset.shots);
-      $('#file-shot').click();
-    };
+  $$('[data-photo]').forEach((btn) => {
+    btn.onclick = () => { $('#file-photo').dataset.seq = btn.dataset.photo; $('#file-photo').click(); };
   });
+  const extraBtn = $('[data-action="extra-photo"]');
+  if (extraBtn) extraBtn.onclick = () => { $('#file-photo').dataset.seq = ''; $('#file-photo').click(); };
   const home = $('[data-action="home"]');
   if (home) home.onclick = () => { state.view = 'home'; render(); };
   paintThumbs();
@@ -1199,7 +1200,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261122125056-e78db3ff';
+  if (version) version.content = '20261122131731-ad76c30f';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
