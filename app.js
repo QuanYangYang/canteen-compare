@@ -401,53 +401,38 @@ function stopAgentPoll() {
 }
 
 async function pollAgentShot() {
-  let data = null;
-  try { data = await (await agentFetch('/task', {}, 6000)).json(); } catch (err) { return; }
-  if (!data) return;
-  // 电脑上点了某个货品 → 手机自动接受这个任务
-  if (!state.waitTask && data.pending) {
-    state.waitTask = { seq: Number(data.pending.seq), until: Date.now() + 15 * 60 * 1000 };
-    await saveWaitTask(state.waitTask);
-    toast(`电脑选了第 ${state.waitTask.seq} 项，等截图`, 'ok');
-    render();
-    return;
-  }
-  let wait = state.waitTask;
-  if (!wait && data.result) {
-    // 电脑上直接按了热键截图（没经过手机请求）：直接把这张收下
-    wait = { seq: Number(data.result.seq), until: Date.now() + 2 * 60 * 1000 };
-    state.waitTask = wait;
-  }
-  if (!wait) return;
-  if (Date.now() > wait.until) {
-    state.waitTask = null;
-    await saveWaitTask(null);
-    toast('等太久了，没有收到电脑截图', 'error');
-    render();
-    return;
-  }
-  if (!data.result || Number(data.result.seq) !== Number(wait.seq)) return;
+  if (!agentBase()) return;
   try {
-    const img = await agentFetch('/result', {}, 20000);
-    const blob = await img.blob();
-    if (!blob.size) return;
-    const file = new File([blob], '电脑截图.png', { type: 'image/png' });
-    await addPhotos([file], { kind: 'online', seq: wait.seq, appName: '电脑截屏' });
-    state.waitTask = null;
-    await saveWaitTask(null);
-    toast('电脑截图已收到', 'ok');
-    render();
+    const d = await (await agentFetch('/shots', {}, 8000)).json();
+    const done = state.doneShots || (state.doneShots = []);
+    for (const s of d.shots || []) {
+      if (done.indexOf(s.id) >= 0) continue;
+      const r = await agentFetch('/shot?id=' + encodeURIComponent(s.id), {}, 20000);
+      const blob = await r.blob();
+      if (!blob.size) continue;
+      const file = new File([blob], '电脑截图.png', { type: 'image/png' });
+      await addPhotos([file], { kind: 'online', seq: Number(s.seq || 0), appName: '电脑截图' });
+      done.push(s.id);
+      await dbPut(STORE_KV, done, 'done_shots');
+      agentFetch('/shot/ack', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: state.agent.pin, id: s.id }),
+      }).catch(() => {});
+      toast(`电脑截图已挂到第 ${s.seq || '?'} 项`, 'ok');
+      render();
+    }
   } catch (err) { /* 下一轮再试 */ }
-}
-
-function startAgentPoll() {
-  if (state.pollTimer) return;
-  state.pollTimer = setInterval(pollAgentShot, 2500);
-  pollAgentShot();
-}
-
-function stopAgentPoll() {
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  try {
+    const c = await (await agentFetch('/commands', {}, 8000)).json();
+    for (const cmd of c.commands || []) {
+      await setInquiry(Number(cmd.seq), cmd.inquiry == null ? '' : cmd.inquiry);
+      agentFetch('/command/ack', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: state.agent.pin, id: cmd.id }),
+      }).catch(() => {});
+      render();
+    }
+  } catch (err) { /* 忽略 */ }
 }
 
 async function pickAgentWindow() {
@@ -868,16 +853,15 @@ function homeView() {
       <p class="hint">回传包只写入「询价结果」，照片放在 照片/、补拍/、比价/ 三个文件夹。</p>
     </section>
     <section class="card">
-      <div class="sheet-head" style="padding:0 0 8px"><h3 style="margin:0">电脑取图（可选）</h3></div>
+      <div class="sheet-head" style="padding:0 0 8px"><h3 style="margin:0">电脑同步（可选）</h3></div>
       <label class="field"><span>取图助手地址</span>
         <input class="input" id="agent-url" inputmode="url" value="${esc(state.agent.url)}" placeholder="http://192.168.1.10:8770"></label>
       <label class="field"><span>配对码</span>
         <input class="input" id="agent-pin" inputmode="numeric" value="${esc(state.agent.pin)}" placeholder="助手窗口里显示的 6 位数字"></label>
-      <p class="hint">投屏窗口：${state.agent.keyword ? esc(state.agent.keyword) : '未选择'}</p>
+      <p class="hint">电脑端在 http://电脑IP:8770/control 里选投屏窗口、截图；截图会自动回到对应货品。</p>
       ${agentPageOrigin() ? '' : '<p class="notice red">当前是 https 页面，浏览器不允许连电脑。请改用 http://电脑IP:8770/ 打开本页。</p>'}
       <div class="modal-actions">
         <button class="btn small" data-action="agent-save">保存</button>
-        <button class="btn small" data-action="agent-window">选择投屏窗口</button>
       </div>
     </section>`;
 }
@@ -947,7 +931,7 @@ function itemCard(item) {
         <button class="btn small icon" data-photo="${item.seq}">拍照${photos.length ? ' ' + photos.length : ''}</button>
       </div>
       <div class="online-row">
-        <button class="btn small online-btn" data-online="${item.seq}">线上比价${shots.length ? ' ' + shots.length : ''}</button>
+        <button class="btn small online-btn" data-shots="${item.seq}">上传截图${shots.length ? ' ' + shots.length : ''}</button>
         ${shots.length ? `<div class="thumb-row online-thumbs">${shots.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
       </div>
       ${photos.length ? `<div class="thumb-row">${photos.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
@@ -983,8 +967,11 @@ function bindList() {
   $$('[data-photo]').forEach((btn) => {
     btn.onclick = () => { $('#file-photo').dataset.seq = btn.dataset.photo; $('#file-photo').click(); };
   });
-  $$('[data-online]').forEach((btn) => {
-    btn.onclick = () => openOnlineSheet(Number(btn.dataset.online));
+  $$('[data-shots]').forEach((btn) => {
+    btn.onclick = () => {
+      state.shotSeq = Number(btn.dataset.shots);
+      $('#file-shot').click();
+    };
   });
   const extra = $('[data-action="extra-photo"]');
   if (extra) extra.onclick = () => { $('#file-photo').dataset.seq = ''; $('#file-photo').click(); };
@@ -1181,6 +1168,14 @@ function bindGlobal() {
     ev.target.value = '';
     if (file) importWorkbook(file);
   };
+  $('#file-shot').onchange = async (ev) => {
+    const files = Array.from(ev.target.files || []);
+    const seq = state.shotSeq;
+    ev.target.value = '';
+    if (!files.length || !seq) return;
+    await addPhotos(files, { kind: 'online', seq });
+    render();
+  };
   $('#file-photo').onchange = (ev) => {
     const files = Array.from(ev.target.files || []);
     const seq = ev.target.dataset.seq;
@@ -1222,7 +1217,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261122085336-e6d55658';
+  if (version) version.content = '20261122090805-8a5b1b6a';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
