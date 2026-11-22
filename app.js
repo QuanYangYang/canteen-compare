@@ -233,6 +233,10 @@ async function saveAgent() {
   await dbPut(STORE_KV, state.agent, 'agent');
 }
 
+function agentPageOrigin() {
+  return location.protocol.indexOf('http') === 0 ? location.origin : '';
+}
+
 function agentBase() {
   const url = String(state.agent.url || '').trim().replace(/\/+$/, '');
   return url;
@@ -271,10 +275,11 @@ function openAgentConfig(seq, message) {
     <div class="sheet-head"><h3>连接电脑取图</h3><button class="icon-btn" data-close-x>×</button></div>
     ${message ? `<p class="notice red">${esc(message)}</p>` : ''}
     <label class="field"><span>取图助手地址</span>
-      <input class="input" id="cfg-url" inputmode="url" value="${esc(agentBase() || state.agent.url)}" placeholder="http://192.168.1.10:8770"></label>
+      <input class="input" id="cfg-url" inputmode="url" value="${esc(agentBase() || (location.protocol.indexOf('http') === 0 ? location.origin : ''))}" placeholder="http://192.168.1.10:8770"></label>
     <label class="field"><span>配对码</span>
       <input class="input" id="cfg-pin" inputmode="numeric" value="${esc(state.agent.pin)}" placeholder="电脑助手窗口里显示的 6 位数字"></label>
     <p class="hint">电脑上双击“取图助手.cmd”，窗口第一行会显示端口、配对码和手机访问地址。</p>
+    ${agentPageOrigin() ? '' : '<p class="notice red">注意：当前页面是 https 版本，填了也连不上。请先在手机浏览器打开 http://电脑IP:8770/ 再进比价单。</p>'}
     <div class="modal-actions">
       <button class="btn" data-close-x>取消</button>
       <button class="btn primary" id="cfg-save">保存并截图</button>
@@ -284,12 +289,12 @@ function openAgentConfig(seq, message) {
     state.agent.pin = ($('#cfg-pin').value || '').trim();
     await saveAgent();
     closeModal();
-    if (state.agent.pin) captureFromAgent(seq);
-    else toast('配对码没填，还是没法截图', 'error');
+    captureFromAgent(seq);
   };
 }
 
 async function captureFromAgent(seq) {
+  if (!state.agent.url && location.protocol.indexOf('http') === 0) state.agent.url = location.origin;
   if (!agentBase()) { openAgentConfig(seq, '还没有填取图助手地址'); return; }
   if (!(await ensureAgentPin())) { openAgentConfig(seq, '需要配对码：电脑助手窗口里显示的 6 位数字'); return; }
   busy('正在让电脑截图…');
@@ -739,6 +744,7 @@ function homeView() {
       <label class="field"><span>配对码</span>
         <input class="input" id="agent-pin" inputmode="numeric" value="${esc(state.agent.pin)}" placeholder="助手窗口里显示的 6 位数字"></label>
       <p class="hint">投屏窗口：${state.agent.keyword ? esc(state.agent.keyword) : '未选择'}</p>
+      ${agentPageOrigin() ? '' : '<p class="notice red">当前是 https 页面，浏览器不允许连电脑。请改用 http://电脑IP:8770/ 打开本页。</p>'}
       <div class="modal-actions">
         <button class="btn small" data-action="agent-save">保存</button>
         <button class="btn small" data-action="agent-window">选择投屏窗口</button>
@@ -883,9 +889,9 @@ function openOnlineSheet(seq) {
     <div class="modal-actions" style="margin-top:14px">
       <button class="btn primary" data-upload-shot>上传截图${shots.length ? `（已加 ${shots.length} 张）` : ''}</button>
     </div>
-    ${agentBase() ? `<div class="modal-actions">
+    ${agentBase() && agentPageOrigin() ? `<div class="modal-actions">
       <button class="btn" data-agent-shot>电脑截投屏</button>
-    </div>` : ''}
+    </div>` : `<p class="hint">电脑取图要在电脑助手提供的地址里用：手机浏览器打开 <b>http://电脑IP:8770/</b>，从那里进比价单。</p>`}
     <div class="modal-actions">
       <button class="btn" data-camera-shot>拍照</button>
       <button class="btn" data-close-x>关闭</button>
@@ -1076,7 +1082,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261122072830-0079c328';
+  if (version) version.content = '20261122073459-ba8a8d02';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
