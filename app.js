@@ -28,6 +28,8 @@ const state = {
   apps: [],
   pendingShot: null,
   agent: { url: '', pin: '', keyword: '' },
+  waitTask: null,
+  pollTimer: null,
   settings: { operator: '' },
   view: 'home',
   filter: '',
@@ -293,34 +295,61 @@ function openAgentConfig(seq, message) {
   };
 }
 
-async function captureFromAgent(seq) {
+async function requestAgentShot(seq) {
   if (!state.agent.url && location.protocol.indexOf('http') === 0) state.agent.url = location.origin;
   if (!agentBase()) { openAgentConfig(seq, '还没有填取图助手地址'); return; }
   if (!(await ensureAgentPin())) { openAgentConfig(seq, '需要配对码：电脑助手窗口里显示的 6 位数字'); return; }
-  busy('正在让电脑截图…');
+  const item = state.items.find((i) => i.seq === seq) || {};
   try {
-    const res = await agentFetch('/capture', {
+    await agentFetch('/task', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pin: state.agent.pin, keyword: state.agent.keyword, delayMs: 2500 }),
-    }, 40000);
-    if (!res.ok) {
-      let msg = '';
-      try { msg = (await res.json()).error || ''; } catch (err) { msg = ''; }
-      throw new Error(msg || ('电脑返回 ' + res.status));
-    }
-    const blob = await res.blob();
-    if (!blob.size) throw new Error('电脑返回空图片');
-    const file = new File([blob], '电脑截图.png', { type: 'image/png' });
-    await addPhotos([file], { kind: 'online', seq, appName: '电脑截屏' });
-    toast('已从电脑取到截图', 'ok');
+      body: JSON.stringify({ pin: state.agent.pin, seq, name: item.name || '' }),
+    }, 8000);
   } catch (err) {
-    const msg = err && err.name === 'AbortError' ? '电脑没回应（检查助手是否在运行）' : (err.message || String(err));
-    if (/pair code|403|配对码/i.test(msg)) { openAgentConfig(seq, '配对码不对，请照着电脑窗口重新填'); return; }
-    toast('取图失败：' + msg, 'error');
-  } finally {
-    unbusy();
+    toast('电脑没收到请求：' + (err.message || err), 'error');
+    return;
   }
+  state.waitTask = { seq, until: Date.now() + 15 * 60 * 1000 };
+  startAgentPoll();
+  toast('电脑已收到：把投屏翻到商品页，按 Ctrl+Alt+S（或电脑上点截图）', 'ok');
+  render();
+}
+
+function startAgentPoll() {
+  if (state.pollTimer) return;
+  state.pollTimer = setInterval(pollAgentShot, 2000);
+  pollAgentShot();
+}
+
+function stopAgentPoll() {
+  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+}
+
+async function pollAgentShot() {
+  const wait = state.waitTask;
+  if (!wait) { stopAgentPoll(); return; }
+  if (Date.now() > wait.until) {
+    state.waitTask = null;
+    stopAgentPoll();
+    toast('等太久了，没有收到电脑截图', 'error');
+    render();
+    return;
+  }
+  try {
+    const res = await agentFetch('/task', {}, 6000);
+    const data = await res.json();
+    if (!data || !data.result || Number(data.result.seq) !== Number(wait.seq)) return;
+    const img = await agentFetch('/result', {}, 20000);
+    const blob = await img.blob();
+    if (!blob.size) return;
+    const file = new File([blob], '电脑截图.png', { type: 'image/png' });
+    await addPhotos([file], { kind: 'online', seq: wait.seq, appName: '电脑截屏' });
+    state.waitTask = null;
+    stopAgentPoll();
+    toast('电脑截图已收到', 'ok');
+    render();
+  } catch (err) { /* 继续等下轮 */ }
 }
 
 async function pickAgentWindow() {
@@ -791,6 +820,7 @@ function listView() {
 function itemCard(item) {
   const photos = photosFor(item.seq);
   const shots = onlinePhotos(item.seq);
+  const waiting = state.waitTask && Number(state.waitTask.seq) === Number(item.seq);
   const filled = item.inquiry !== null && item.inquiry !== '';
   return `
     <article class="item ${filled ? 'done' : ''}" data-seq="${item.seq}">
@@ -928,7 +958,7 @@ function openOnlineSheet(seq) {
   $('[data-upload-shot]').onclick = () => { shotInput.dataset.seq = String(seq); shotInput.click(); };
   $('[data-camera-shot]').onclick = () => { camInput.dataset.seq = String(seq); camInput.click(); };
   const agentBtn = $('[data-agent-shot]');
-  if (agentBtn) agentBtn.onclick = () => { closeModal(); captureFromAgent(seq); };
+  if (agentBtn) agentBtn.onclick = () => { closeModal(); requestAgentShot(seq); };
 }
 
 function openAddApp(seq) {
@@ -1082,13 +1112,14 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261122073459-ba8a8d02';
+  if (version) version.content = '20261122081155-2632817a';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
     const away = state.awayAt ? Date.now() - state.awayAt : 0;
     state.awayAt = 0;
     if (away >= OUTSIDE_WAIT_MS) maybePromptReturn();
+    if (state.waitTask) pollAgentShot();
   });
   window.addEventListener('pageshow', () => { maybePromptReturn(); });
 }
