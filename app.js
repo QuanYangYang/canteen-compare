@@ -291,8 +291,40 @@ function openAgentConfig(seq, message) {
     state.agent.pin = ($('#cfg-pin').value || '').trim();
     await saveAgent();
     closeModal();
-    captureFromAgent(seq);
+    startAgentPoll();
+    requestAgentShot(seq);
   };
+}
+
+
+async function syncSheetToAgent() {
+  if (!agentBase() || !state.sheet) return;
+  if (!(await ensureAgentPin())) return;
+  try {
+    await agentFetch('/sheet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pin: state.agent.pin,
+        sheet_no: state.sheet.sheetNo || '',
+        items: state.items.map((i) => ({ seq: i.seq, name: i.name, unit: i.unit, qty: i.qty })),
+      }),
+    }, 8000);
+    startAgentPoll();
+  } catch (err) { /* 电脑没开就忽略 */ }
+}
+
+async function saveWaitTask(task) {
+  if (task) await dbPut(STORE_KV, task, 'wait_task');
+  else await dbDel(STORE_KV, 'wait_task');
+}
+
+async function restoreWaitTask() {
+  const saved = await dbGet(STORE_KV, 'wait_task');
+  if (!saved || !saved.seq) return;
+  if (Date.now() > Number(saved.until || 0)) { await saveWaitTask(null); return; }
+  state.waitTask = { seq: saved.seq, until: saved.until };
+  startAgentPoll();
 }
 
 async function requestAgentShot(seq) {
@@ -311,6 +343,7 @@ async function requestAgentShot(seq) {
     return;
   }
   state.waitTask = { seq, until: Date.now() + 15 * 60 * 1000 };
+  await saveWaitTask(state.waitTask);
   startAgentPoll();
   toast('电脑已收到：把投屏翻到商品页，按 Ctrl+Alt+S（或电脑上点截图）', 'ok');
   render();
@@ -327,29 +360,53 @@ function stopAgentPoll() {
 }
 
 async function pollAgentShot() {
-  const wait = state.waitTask;
-  if (!wait) { stopAgentPoll(); return; }
+  let data = null;
+  try { data = await (await agentFetch('/task', {}, 6000)).json(); } catch (err) { return; }
+  if (!data) return;
+  // 电脑上点了某个货品 → 手机自动接受这个任务
+  if (!state.waitTask && data.pending) {
+    state.waitTask = { seq: Number(data.pending.seq), until: Date.now() + 15 * 60 * 1000 };
+    await saveWaitTask(state.waitTask);
+    toast(`电脑选了第 ${state.waitTask.seq} 项，等截图`, 'ok');
+    render();
+    return;
+  }
+  let wait = state.waitTask;
+  if (!wait && data.result) {
+    // 电脑上直接按了热键截图（没经过手机请求）：直接把这张收下
+    wait = { seq: Number(data.result.seq), until: Date.now() + 2 * 60 * 1000 };
+    state.waitTask = wait;
+  }
+  if (!wait) return;
   if (Date.now() > wait.until) {
     state.waitTask = null;
-    stopAgentPoll();
+    await saveWaitTask(null);
     toast('等太久了，没有收到电脑截图', 'error');
     render();
     return;
   }
+  if (!data.result || Number(data.result.seq) !== Number(wait.seq)) return;
   try {
-    const res = await agentFetch('/task', {}, 6000);
-    const data = await res.json();
-    if (!data || !data.result || Number(data.result.seq) !== Number(wait.seq)) return;
     const img = await agentFetch('/result', {}, 20000);
     const blob = await img.blob();
     if (!blob.size) return;
     const file = new File([blob], '电脑截图.png', { type: 'image/png' });
     await addPhotos([file], { kind: 'online', seq: wait.seq, appName: '电脑截屏' });
     state.waitTask = null;
-    stopAgentPoll();
+    await saveWaitTask(null);
     toast('电脑截图已收到', 'ok');
     render();
-  } catch (err) { /* 继续等下轮 */ }
+  } catch (err) { /* 下一轮再试 */ }
+}
+
+function startAgentPoll() {
+  if (state.pollTimer) return;
+  state.pollTimer = setInterval(pollAgentShot, 2500);
+  pollAgentShot();
+}
+
+function stopAgentPoll() {
+  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
 }
 
 async function pickAgentWindow() {
@@ -443,6 +500,7 @@ async function importWorkbook(file) {
     state.view = 'home';
     render();
     toast(`已导入 ${parsed.sheet.sheetNo}，共 ${parsed.items.length} 项`, 'ok');
+  syncSheetToAgent();
   } catch (err) {
     toast(err.message || '导入失败', 'error');
   } finally {
@@ -782,7 +840,7 @@ function homeView() {
 }
 
 function bindHome() {
-  $('[data-action="start"]').onclick = () => { state.view = 'list'; render(); };
+  $('[data-action="start"]').onclick = () => { state.view = 'list'; render(); syncSheetToAgent(); };
   $('[data-action="export"]').onclick = exportPackage;
   $('[data-action="pick-note"]').onclick = () => $('#file-note').click();
   const op = $('#operator');
@@ -1112,7 +1170,7 @@ function bindGlobal() {
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261122081155-2632817a';
+  if (version) version.content = '20261122083833-f2de5406';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
@@ -1130,6 +1188,8 @@ async function init() {
     if (settings) state.settings = Object.assign(state.settings, settings);
     await loadApps();
     await loadAgent();
+    await restoreWaitTask();
+  if (agentBase()) startAgentPoll();
     await loadPendingShot();
     const sheet = await dbGet(STORE_KV, 'sheet');
     if (sheet) {
