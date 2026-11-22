@@ -558,31 +558,20 @@ async function exportPackage() {
       entry.push(bytes, true);
     };
     addEntry(`比价信息表_${state.sheet.sheetNo}.xlsx`, new Uint8Array(xlsx));
-    const perLine = {};
     const perLineOnline = {};
-    let extraCount = 0;
-    const photos = state.photos.slice();
+    const photos = state.photos.filter((p) => p.kind === 'online');
     for (let i = 0; i < photos.length; i++) {
       const photo = photos[i];
-      $('#busy-text').textContent = `正在打包照片 ${i + 1}/${photos.length}…`;
+      $('#busy-text').textContent = `正在打包截图 ${i + 1}/${photos.length}…`;
       let blob = photo.blob;
       if (!blob) continue;
       if (blob.size > MAX_PHOTO_BYTES) blob = await compressPhoto(blob);
       const bytes = new Uint8Array(await blob.arrayBuffer());
       const ext = photo.ext || 'jpg';
-      if (photo.kind === 'extra') {
-        extraCount += 1;
-        addEntry(`补拍/${base}-补-${extraCount}.${ext}`, bytes);
-      } else if (photo.kind === 'online') {
-        const lineSeq = Number(photo.seq) || 0;
-        perLineOnline[lineSeq] = (perLineOnline[lineSeq] || 0) + 1;
-        const line = String(lineSeq).padStart(2, '0');
-        addEntry(`比价/${base}-${line}-${perLineOnline[lineSeq]}.${ext}`, bytes);
-      } else {
-        perLine[photo.seq] = (perLine[photo.seq] || 0) + 1;
-        const line = String(photo.seq).padStart(2, '0');
-        addEntry(`照片/${base}-${line}-${perLine[photo.seq]}.${ext}`, bytes);
-      }
+      const lineSeq = Number(photo.seq) || 0;
+      perLineOnline[lineSeq] = (perLineOnline[lineSeq] || 0) + 1;
+      const line = String(lineSeq).padStart(2, '0');
+      addEntry(`比价/${base}-${line}-${perLineOnline[lineSeq]}.${ext}`, bytes);
     }
     zip.end();
     const blob = await done;
@@ -850,7 +839,7 @@ function homeView() {
     <section class="card">
       <label class="field"><span>验收人 / 操作员</span>
         <input class="input" id="operator" value="${esc(state.settings.operator)}" placeholder="例如 张三"></label>
-      <p class="hint">回传包只写入「询价结果」，照片放在 照片/、补拍/、比价/ 三个文件夹。</p>
+      <p class="hint">回传包只写入「询价结果」，截图放在 比价/ 文件夹。</p>
     </section>
     <section class="card">
       <div class="sheet-head" style="padding:0 0 8px"><h3 style="margin:0">电脑同步（可选）</h3></div>
@@ -902,7 +891,6 @@ function listView() {
   return `
     <div class="freeze-bar">
       <div class="search-box"><input id="q" type="search" placeholder="搜索品名 / 序号" value="${esc(state.filter)}"></div>
-      <button class="btn small" data-action="extra-photo">补拍</button>
     </div>
     <p class="list-meter">已填 ${filled}/${state.items.length}${q ? ` · 命中 ${items.length}` : ''}</p>
     <p class="agent-status-line"><span id="agent-status">电脑取图：未配置</span>
@@ -928,13 +916,11 @@ function itemCard(item) {
           <input class="input" type="number" inputmode="decimal" step="0.01" min="0" data-inquiry="${item.seq}"
             value="${filled ? item.inquiry : ''}" placeholder="填单价"></label>
         <button class="btn small" data-convert="${item.seq}">换算</button>
-        <button class="btn small icon" data-photo="${item.seq}">拍照${photos.length ? ' ' + photos.length : ''}</button>
       </div>
       <div class="online-row">
         <button class="btn small online-btn" data-shots="${item.seq}">上传截图${shots.length ? ' ' + shots.length : ''}</button>
         ${shots.length ? `<div class="thumb-row online-thumbs">${shots.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
       </div>
-      ${photos.length ? `<div class="thumb-row">${photos.map((p) => `<img src="${p.thumbUrl || ''}" data-view="${p.id}" alt="">`).join('')}</div>` : ''}
     </article>`;
 }
 
@@ -964,17 +950,12 @@ function bindList() {
     };
   });
   $$('[data-convert]').forEach((btn) => { btn.onclick = () => openConvert(Number(btn.dataset.convert)); });
-  $$('[data-photo]').forEach((btn) => {
-    btn.onclick = () => { $('#file-photo').dataset.seq = btn.dataset.photo; $('#file-photo').click(); };
-  });
   $$('[data-shots]').forEach((btn) => {
     btn.onclick = () => {
       state.shotSeq = Number(btn.dataset.shots);
       $('#file-shot').click();
     };
   });
-  const extra = $('[data-action="extra-photo"]');
-  if (extra) extra.onclick = () => { $('#file-photo').dataset.seq = ''; $('#file-photo').click(); };
   const home = $('[data-action="home"]');
   if (home) home.onclick = () => { state.view = 'home'; render(); };
   paintThumbs();
@@ -1211,13 +1192,14 @@ function bindGlobal() {
           await dbDel(STORE_PHOTOS, photo.id);
           state.photos = await dbAll(STORE_PHOTOS);
           closeModal();
+          syncSoon();
           render();
         };
       }
     }
   });
   const version = document.querySelector('meta[name="app-version"]');
-  if (version) version.content = '20261122090805-8a5b1b6a';
+  if (version) version.content = '20261122125056-e78db3ff';
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { state.awayAt = Date.now(); return; }
